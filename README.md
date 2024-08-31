@@ -26,9 +26,9 @@ competition page: https://www.guruguru.science/competitions/24
 
    ```bash
    make setup
-   python -m src.exp.exp002
-   python -m src.exp.exp004
-   python -m src.exp.exp006
+   python -m src.exp.exp002.train && python -m src.exp.exp002.test
+   python -m src.exp.exp004.train && python -m src.exp.exp004.test
+   python -m src.exp.exp006.train && python -m src.exp.exp006.test
    python -m ensemble
    ```
 
