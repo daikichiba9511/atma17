@@ -9,7 +9,6 @@
     "customizations": {
         "vscode": {
             "extensions": [
-                "njpwerner.autodocstring",
                 "ms-vscode-remote.remote-containers",
                 "ms-azuretools.vscode-docker",
                 "usernamehw.errorlens",

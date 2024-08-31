@@ -7,10 +7,11 @@ import polars as pl
 import pydantic
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import transformers
 from datasets import Dataset
 from sklearn import model_selection
-from transformers import AutoTokenizer, DataCollatorWithPadding, Trainer, TrainingArguments, logging
+from transformers import AutoTokenizer, DataCollatorWithPadding, Trainer, TrainingArguments
 
 from src import constants, log, metrics, utils
 
@@ -22,6 +23,9 @@ logger = log.get_root_logger()
 EXP_NO = __file__.split("/")[-2]
 DESCRIPTION = """
 simple baseline
++ promptの作り方を変える Title: <title> [SEP] Review_Text: <review> text>
++ fill_null("none")で埋める
++ aux task
 """
 
 
@@ -48,14 +52,15 @@ class Config(pydantic.BaseModel):
 
     target_cols: list[str] = pydantic.Field(default_factory=lambda: ["Recommended IND"])
     model_path: str = pydantic.Field(default="microsoft/deberta-v3-large")
+    # model_path: str = pydantic.Field(default="microsoft/deberta-v3-base")
 
     max_length: int = pydantic.Field(default=256)
 
-    lr: float = pydantic.Field(default=2e-5)
+    lr: float = pydantic.Field(default=1e-5)
     num_train_epochs: int = pydantic.Field(default=5)
-    per_device_train_batch_size: int = pydantic.Field(default=8)
-    per_device_valid_batch_size: int = pydantic.Field(default=8)
-    gradient_accumulation_steps: int = pydantic.Field(default=4)
+    per_device_train_batch_size: int = pydantic.Field(default=8 // 1)
+    per_device_valid_batch_size: int = pydantic.Field(default=8 // 1)
+    gradient_accumulation_steps: int = pydantic.Field(default=4 * 1)
 
     steps: int = pydantic.Field(default=25)
 
@@ -65,25 +70,35 @@ def preprocessing(df: pl.DataFrame) -> pl.DataFrame:
         pl.col("Title").fill_null("").alias("Title"),
         pl.col("Review Text").fill_null("").alias("Review Text"),
     ).with_columns(
-        (pl.col("Title") + " [TITLE] " + pl.col("Review Text")).alias("prompt"),
+        ("Titlte: " + pl.col("Title") + " [SEP] " + "Review Text: " + pl.col("Review Text")).alias("prompt"),
     )
     return df
 
 
 def tokenize(
-    df: dict,
+    data: dict,
     tokenizer: transformers.PreTrainedTokenizer | transformers.PreTrainedTokenizerFast,
     max_length: int = 256,
     padding: str | bool = False,
     truncation: bool = True,
 ) -> transformers.BatchEncoding:
-    return tokenizer(df["prompt"], truncation=truncation, max_length=max_length, padding=padding)
+    return tokenizer(data["prompt"], truncation=truncation, max_length=max_length, padding=padding)
+
+
+def to_onehot(data: dict) -> dict:
+    data["aux_labels"] = nn.functional.one_hot(torch.tensor(data["Rating"]), 6).float()
+    return data
 
 
 def compute_metrics(eval_pred: transformers.EvalPrediction) -> dict:
-    preds, labels = eval_pred
-    if not isinstance(labels, np.ndarray):
-        raise ValueError("labels should be numpy array")
+    preds, all_labels = eval_pred
+    if isinstance(all_labels, tuple):
+        labels = all_labels[0]
+    else:
+        labels = all_labels
+    if isinstance(preds, tuple):
+        preds = preds[0]
+
     preds = torch.softmax(torch.from_numpy(preds), dim=1).numpy()
     return {"auc": metrics.score(y_true=labels, y_pred=preds[:, 1])}
 
@@ -93,8 +108,100 @@ class LoggingCallback(transformers.TrainerCallback):
         logger.info(f"Eval on Trainer: {state.log_history[-1]}")
 
 
+class FocalLoss(nn.Module):
+    def __init__(self, reduction="none", alpha=1, gamma=2):
+        super().__init__()
+        self.reduction = reduction
+        self.alpha = alpha
+        self.gamma = gamma
+
+    def forward(self, inputs: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        bce_loss = F.binary_cross_entropy_with_logits(inputs, targets, reduction="none")
+        pt = torch.exp(-bce_loss)
+        loss = self.alpha * (1.0 - pt) ** self.gamma * bce_loss
+        if self.reduction == "none":
+            loss = loss
+        elif self.reduction == "sum":
+            loss = loss.sum()
+        elif self.reduction == "mean":
+            loss = loss.mean()
+        return loss
+
+
+class SmoothFocalLoss(nn.Module):
+    def __init__(self, reduction="none", alpha=1, gamma=2, smoothing=0.0):
+        super().__init__()
+        self.reduction = reduction
+        self.focal_loss = FocalLoss(reduction="none", alpha=alpha, gamma=gamma)
+        self.smoothing = smoothing
+
+    @staticmethod
+    def _smooth(targets: torch.Tensor, smoothing: float = 0.0) -> torch.Tensor:
+        assert 0 <= smoothing < 1
+        with torch.no_grad():
+            targets = targets * (1.0 - smoothing) + 0.5 * smoothing
+        return targets
+
+    def forward(self, inputs: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        targets = self._smooth(targets, self.smoothing)
+        loss = self.focal_loss(inputs, targets)
+        if self.reduction == "none":
+            loss = loss
+        elif self.reduction == "sum":
+            loss = loss.sum()
+        elif self.reduction == "mean":
+            loss = loss.mean()
+        return loss
+
+
+class CustomTrainer(Trainer):
+    """
+    References:
+    1. https://dev.classmethod.jp/articles/huggingface-usage-custom-loss-func/
+    """
+
+    def compute_loss(
+        self, model: Atma17CustomModel, inputs: dict, return_outputs: bool = False
+    ) -> tuple[torch.Tensor, torch.Tensor] | torch.Tensor:
+        aux_labels = inputs.pop("aux_labels")
+        outputs = model(**inputs)
+
+        aux_loss = F.cross_entropy(input=outputs.aux_logits, target=aux_labels, label_smoothing=0.05)
+        outputs["aux_loss"] = aux_loss
+
+        loss = F.cross_entropy(
+            input=outputs.logits,
+            target=nn.functional.one_hot(inputs["labels"], 2).float(),
+            weight=outputs.attentions,
+            label_smoothing=0.05,
+        )
+        weight_aux_loss = 0.5
+        loss = loss + weight_aux_loss * aux_loss
+        return (loss, outputs) if return_outputs else loss
+
+
+def _test_dataset() -> None:
+    tokenizer = AutoTokenizer.from_pretrained("microsoft/deberta-v3-large")
+    train_df = pl.read_csv(constants.DATA_DIR / "train.csv")
+    train_df = preprocessing(train_df)
+    train_df = train_df.with_columns(pl.col("Recommended IND").cast(pl.Int32).alias("labels"))
+    ds_train = (
+        Dataset.from_pandas(
+            train_df.to_pandas(use_pyarrow_extension_array=True).iloc[:100].loc[:, ["prompt", "labels", "Rating"]]
+        )
+        .map(functools.partial(tokenize, tokenizer=tokenizer, max_length=256, padding=True))
+        .map(to_onehot)
+        # .remove_columns(["prompt", "__index_level_0__"])
+    )
+    ds_train.set_format(type="torch", columns=["input_ids", "attention_mask", "labels", "aux_labels"])
+    batch = next(iter(ds_train))
+    print(batch)
+    print(batch.keys())  # type: ignore
+
+
 def main() -> None:
     cfg = Config(is_debug=False)
+    cfg.output_dir.mkdir(parents=True, exist_ok=True)
     log.attach_file_handler(logger, str(cfg.output_dir / "train.log"))
     utils.pinfo(cfg.model_dump())
 
@@ -119,22 +226,30 @@ def main() -> None:
     for fold, (train_idx, valid_idx) in enumerate(
         kfold.split(train_df.to_pandas(use_pyarrow_extension_array=True), train_df[cfg.target_cols[0]])
     ):
-        logger.info(f"Start Training Fold: {fold}")
         utils.seed_everything(cfg.seed)
+        logger.info(f"Start Training Fold: {fold}")
         ds_train = (
             Dataset.from_pandas(
-                train_df.to_pandas(use_pyarrow_extension_array=True).iloc[train_idx].loc[:, ["prompt", "labels"]]
+                train_df.to_pandas(use_pyarrow_extension_array=True)
+                .iloc[train_idx]
+                .loc[:, ["prompt", "labels", "Rating"]],
             )
-            .map(functools.partial(tokenize, tokenizer=tokenizer, max_length=cfg.max_length, padding=True))
-            .remove_columns(["prompt", "__index_level_0__"])
+            .map(functools.partial(tokenize, tokenizer=tokenizer, max_length=cfg.max_length, padding="max_length"))
+            .map(to_onehot)
+            .remove_columns(["prompt", "__index_level_0__", "Rating"])
         )
+        # ds_train.set_format(type="torch", columns=["input_ids", "attention_mask", "labels", "aux_labels"])
         ds_valid = (
             Dataset.from_pandas(
-                train_df.to_pandas(use_pyarrow_extension_array=True).iloc[valid_idx].loc[:, ["prompt", "labels"]]
+                train_df.to_pandas(use_pyarrow_extension_array=True)
+                .iloc[valid_idx]
+                .loc[:, ["prompt", "labels", "Rating"]]
             )
-            .map(functools.partial(tokenize, tokenizer=tokenizer, max_length=cfg.max_length, padding=True))
-            .remove_columns(["prompt", "__index_level_0__"])
+            .map(functools.partial(tokenize, tokenizer=tokenizer, max_length=cfg.max_length, padding="max_length"))
+            .map(to_onehot)
+            .remove_columns(["prompt", "__index_level_0__", "Rating"])
         )
+        # ds_valid.set_format(type="torch", columns=["input_ids", "attention_mask", "labels", "aux_labels"])
         train_args = TrainingArguments(
             output_dir=str(cfg.output_dir / f"fold{fold}"),
             fp16=True,
@@ -160,9 +275,14 @@ def main() -> None:
             data_seed=cfg.seed,
             optim="adamw_torch",
             load_best_model_at_end=True,
+            label_names=["labels", "aux_labels"],
         )
         model = Atma17CustomModel(model_path=cfg.model_path)
-        trainer = Trainer(
+        # dummy forward for lazy initialization
+        i = torch.randint(0, 1000, (8, 256))
+        _ = model(i, torch.randint(0, 2, (8,)))
+
+        trainer = CustomTrainer(
             model=model,
             args=train_args,
             train_dataset=ds_train,
@@ -182,7 +302,9 @@ def main() -> None:
             trainer.model.state_dict(),
             str(cfg.output_dir / f"deverta-large-seed{cfg.seed}-fold{fold}" / f"best_model_fold{fold}.pth"),
         )
-        preds[valid_idx] = torch.tensor(trainer.predict(ds_valid).predictions).softmax(dim=1).numpy()  # type: ignore
+        preds_ = trainer.predict(ds_valid).predictions[0]  # type: ignore
+        preds_ = torch.tensor(preds_).softmax(dim=1).numpy()  # type: ignore
+        preds[valid_idx] = preds_
         folds[valid_idx] = fold
 
     train_df = train_df.with_columns(pl.Series("preds", preds[:, 1]), pl.Series("folds", folds))
@@ -193,4 +315,5 @@ def main() -> None:
 
 
 if __name__ == "__main__":
+    # _test_dataset()
     main()

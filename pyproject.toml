@@ -1,8 +1,8 @@
 # Ref
 # 1. https://packaging.python.org/en/latest/guides/writing-pyproject-toml/
 [project]
-name = "compe"
-description = "A solution for kaggle competition ."
+name = "atmacup17"
+description = "A solution for atmacup17 competition ."
 version = "0.1.0"
 authors = [{ name = "daikichiba9511", email = "daikichiba.tech.ml@gmail.com" }]
 requires-python = ">= 3.10"
@@ -10,7 +10,7 @@ requires-python = ">= 3.10"
 # Supposed that pytorch etc. has been installed by base image
 dependencies = [
   "numpy<2.0.0",
-  "pandas",
+  "pandas[all]",
   "polars",
   "hvplot",
   "pydantic",
@@ -22,6 +22,8 @@ dependencies = [
   "lightgbm",
   "transformers",
   "accelerate",
+  "datasets",
+  "sentencepiece",
 ]
 [project.optional-dependencies]
 dev = [

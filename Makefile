@@ -1,6 +1,6 @@
 .DEFAULT_GOAL := help
 SHELL := /usr/bin/env bash
-COMPE :=
+COMPE := atmacup17
 PYTHONPATH := $(shell pwd)
 
 .PHONY: setup

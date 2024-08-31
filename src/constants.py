@@ -2,7 +2,7 @@ import os
 import pathlib
 
 IS_KAGGLE = os.getenv("KAGGLE") is not None
-COMPE_NAME = ""
+COMPE_NAME = "atmacup17"
 
 ROOT = pathlib.Path("/kaggle") if IS_KAGGLE else pathlib.Path(__file__).resolve().parents[1]
 INPUT_DIR = ROOT / "input"

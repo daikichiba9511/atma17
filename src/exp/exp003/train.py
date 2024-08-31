@@ -22,6 +22,12 @@ logger = log.get_root_logger()
 EXP_NO = __file__.split("/")[-2]
 DESCRIPTION = """
 simple baseline
++ promptの作り方を変える Title: <title> [SEP] Review_Text: <review> text>
++ fill_null("none")で埋める
++ aux task
++ feature engineering
+    + stats of positive feedback count by clothing id
+    + stats of age by clothing id
 """
 
 
@@ -51,11 +57,11 @@ class Config(pydantic.BaseModel):
 
     max_length: int = pydantic.Field(default=256)
 
-    lr: float = pydantic.Field(default=2e-5)
+    lr: float = pydantic.Field(default=2e-4)
     num_train_epochs: int = pydantic.Field(default=5)
-    per_device_train_batch_size: int = pydantic.Field(default=8)
-    per_device_valid_batch_size: int = pydantic.Field(default=8)
-    gradient_accumulation_steps: int = pydantic.Field(default=4)
+    per_device_train_batch_size: int = pydantic.Field(default=4)
+    per_device_valid_batch_size: int = pydantic.Field(default=4)
+    gradient_accumulation_steps: int = pydantic.Field(default=8)
 
     steps: int = pydantic.Field(default=25)
 
@@ -65,26 +71,88 @@ def preprocessing(df: pl.DataFrame) -> pl.DataFrame:
         pl.col("Title").fill_null("").alias("Title"),
         pl.col("Review Text").fill_null("").alias("Review Text"),
     ).with_columns(
-        (pl.col("Title") + " [TITLE] " + pl.col("Review Text")).alias("prompt"),
+        ("Titlte: " + pl.col("Title") + " [SEP] " + "Review Text: " + pl.col("Review Text")).alias("prompt"),
+    )
+    df = df.join(
+        df.group_by("Clothing ID").agg(
+            mean_positive_feedback_count=pl.mean("Positive Feedback Count").fill_null(-1),
+            std_positive_feedback_count=pl.std("Positive Feedback Count").fill_null(-1),
+            min_positvie_feedback_count=pl.min("Positive Feedback Count").fill_null(-1),
+            max_positive_feedback_count=pl.max("Positive Feedback Count").fill_null(-1),
+        ),
+        on="Clothing ID",
+    ).join(
+        df.group_by("Clothing ID").agg(
+            mean_age=pl.mean("Age").fill_null(0),
+            std_age=pl.std("Age").fill_null(0),
+            min_age=pl.min("Age").fill_null(0),
+            max_age=pl.max("Age").fill_null(0),
+        ),
+        on="Clothing ID",
+    )
+    df = df.with_columns(
+        # --- feats for Positive Feedback Count
+        diff_mean_positive_feedback_count=pl.col("Positive Feedback Count") - pl.col("mean_positive_feedback_count"),
+        diff_std_positive_feedback_count=pl.col("Positive Feedback Count") - pl.col("std_positive_feedback_count"),
+        diff_min_positvie_feedback_count=pl.col("Positive Feedback Count") - pl.col("min_positvie_feedback_count"),
+        diff_max_positive_feedback_count=pl.col("Positive Feedback Count") - pl.col("max_positive_feedback_count"),
+        # --- feats for Age
+        diff_mean_age=pl.col("Age") - pl.col("mean_age"),
+        diff_std_age=pl.col("Age") - pl.col("std_age"),
+        diff_min_age=pl.col("Age") - pl.col("min_age"),
+        diff_max_age=pl.col("Age") - pl.col("max_age"),
     )
     return df
 
 
+USE_FEATURES = [
+    # --- feats for Positive Feedback Count
+    "mean_positive_feedback_count",
+    "std_positive_feedback_count",
+    "min_positvie_feedback_count",
+    "max_positive_feedback_count",
+    "diff_mean_positive_feedback_count",
+    "diff_std_positive_feedback_count",
+    "diff_min_positvie_feedback_count",
+    "diff_max_positive_feedback_count",
+    # --- feats for Age
+    "mean_age",
+    "std_age",
+    "min_age",
+    "max_age",
+    "diff_mean_age",
+    "diff_std_age",
+    "diff_min_age",
+    "diff_max_age",
+]
+
+
 def tokenize(
-    df: dict,
+    data: dict,
     tokenizer: transformers.PreTrainedTokenizer | transformers.PreTrainedTokenizerFast,
     max_length: int = 256,
     padding: str | bool = False,
     truncation: bool = True,
 ) -> transformers.BatchEncoding:
-    return tokenizer(df["prompt"], truncation=truncation, max_length=max_length, padding=padding)
+    return tokenizer(data["prompt"], truncation=truncation, max_length=max_length, padding=padding)
+
+
+def to_onehot(data: dict) -> dict:
+    data["aux_labels"] = nn.functional.one_hot(torch.tensor(data["Rating"]), 6).float()
+    return data
 
 
 def compute_metrics(eval_pred: transformers.EvalPrediction) -> dict:
-    preds, labels = eval_pred
-    if not isinstance(labels, np.ndarray):
-        raise ValueError("labels should be numpy array")
+    preds, all_labels = eval_pred
+    if isinstance(all_labels, tuple):
+        labels = all_labels[0]
+    else:
+        labels = all_labels
+    if isinstance(preds, tuple):
+        preds = preds[0]
+
     preds = torch.softmax(torch.from_numpy(preds), dim=1).numpy()
+    assert preds.shape[1] == 2
     return {"auc": metrics.score(y_true=labels, y_pred=preds[:, 1])}
 
 
@@ -93,8 +161,56 @@ class LoggingCallback(transformers.TrainerCallback):
         logger.info(f"Eval on Trainer: {state.log_history[-1]}")
 
 
+class CustomTrainer(Trainer):
+    """
+    References:
+    1. https://dev.classmethod.jp/articles/huggingface-usage-custom-loss-func/
+    """
+
+    def compute_loss(
+        self, model: Atma17CustomModel, inputs: dict, return_outputs: bool = False
+    ) -> tuple[torch.Tensor, torch.Tensor] | torch.Tensor:
+        aux_labels = inputs.pop("aux_labels")
+
+        more_features = []
+        for col in USE_FEATURES:
+            feat = inputs.pop(col)
+            more_features.append(feat.reshape(-1, 1))
+        more_features = torch.cat(more_features, dim=1)
+        inputs["more_features"] = more_features
+        outputs = model(**inputs)
+
+        loss = nn.SmoothL1Loss()(outputs.logits, inputs["labels"])
+
+        aux_loss = nn.functional.cross_entropy(input=outputs.aux_logits, target=aux_labels)
+        outputs["aux_loss"] = aux_loss
+
+        weight_aux_loss = 0.5
+        loss = loss + weight_aux_loss * aux_loss
+        return (loss, outputs) if return_outputs else loss
+
+
+def _test_dataset() -> None:
+    tokenizer = AutoTokenizer.from_pretrained("microsoft/deberta-v3-large")
+    train_df = pl.read_csv(constants.DATA_DIR / "train.csv")
+    train_df = preprocessing(train_df)
+    train_df = train_df.with_columns(pl.col("Recommended IND").cast(pl.Int32).alias("labels"))
+    ds_train = (
+        Dataset.from_pandas(
+            train_df.to_pandas(use_pyarrow_extension_array=True).iloc[:100].loc[:, ["prompt", "labels", "Rating"]]
+        )
+        .map(functools.partial(tokenize, tokenizer=tokenizer, max_length=256, padding=True))
+        .map(to_onehot)
+        # .remove_columns(["prompt", "__index_level_0__"])
+    )
+    batch = next(iter(ds_train))
+    print(batch)
+    print(batch.keys())  # type: ignore
+
+
 def main() -> None:
     cfg = Config(is_debug=False)
+    cfg.output_dir.mkdir(parents=True, exist_ok=True)
     log.attach_file_handler(logger, str(cfg.output_dir / "train.log"))
     utils.pinfo(cfg.model_dump())
 
@@ -119,20 +235,26 @@ def main() -> None:
     for fold, (train_idx, valid_idx) in enumerate(
         kfold.split(train_df.to_pandas(use_pyarrow_extension_array=True), train_df[cfg.target_cols[0]])
     ):
-        logger.info(f"Start Training Fold: {fold}")
         utils.seed_everything(cfg.seed)
+        logger.info(f"Start Training Fold: {fold}")
         ds_train = (
-            Dataset.from_pandas(
-                train_df.to_pandas(use_pyarrow_extension_array=True).iloc[train_idx].loc[:, ["prompt", "labels"]]
+            Dataset.from_pandas(train_df.to_pandas(use_pyarrow_extension_array=True).iloc[train_idx])
+            .map(
+                functools.partial(
+                    tokenize, tokenizer=tokenizer, max_length=cfg.max_length, padding="max_length", truncation=True
+                )
             )
-            .map(functools.partial(tokenize, tokenizer=tokenizer, max_length=cfg.max_length, padding=True))
+            .map(to_onehot)
             .remove_columns(["prompt", "__index_level_0__"])
         )
         ds_valid = (
-            Dataset.from_pandas(
-                train_df.to_pandas(use_pyarrow_extension_array=True).iloc[valid_idx].loc[:, ["prompt", "labels"]]
+            Dataset.from_pandas(train_df.to_pandas(use_pyarrow_extension_array=True).iloc[valid_idx])
+            .map(
+                functools.partial(
+                    tokenize, tokenizer=tokenizer, max_length=cfg.max_length, padding="max_length", truncation=True
+                )
             )
-            .map(functools.partial(tokenize, tokenizer=tokenizer, max_length=cfg.max_length, padding=True))
+            .map(to_onehot)
             .remove_columns(["prompt", "__index_level_0__"])
         )
         train_args = TrainingArguments(
@@ -160,9 +282,18 @@ def main() -> None:
             data_seed=cfg.seed,
             optim="adamw_torch",
             load_best_model_at_end=True,
+            label_names=["labels", "aux_labels"] + USE_FEATURES,
         )
-        model = Atma17CustomModel(model_path=cfg.model_path)
-        trainer = Trainer(
+        model = Atma17CustomModel(cfg.model_path)
+        # dummy forward for lazy initialization
+        _ = model(
+            input_ids=torch.randint(0, 1000, (8, cfg.max_length)),
+            labels=torch.randint(0, 2, (8,)),
+            attention_mask=torch.randint(0, 1, (8, cfg.max_length)),
+            more_features=torch.randn(8, 16),
+        )
+
+        trainer = CustomTrainer(
             model=model,
             args=train_args,
             train_dataset=ds_train,
@@ -182,7 +313,9 @@ def main() -> None:
             trainer.model.state_dict(),
             str(cfg.output_dir / f"deverta-large-seed{cfg.seed}-fold{fold}" / f"best_model_fold{fold}.pth"),
         )
-        preds[valid_idx] = torch.tensor(trainer.predict(ds_valid).predictions).softmax(dim=1).numpy()  # type: ignore
+        preds_ = trainer.predict(ds_valid).predictions[0]  # type: ignore
+        preds_ = torch.tensor(preds_).softmax(dim=1).numpy()  # type: ignore
+        preds[valid_idx] = preds_
         folds[valid_idx] = fold
 
     train_df = train_df.with_columns(pl.Series("preds", preds[:, 1]), pl.Series("folds", folds))
@@ -193,4 +326,5 @@ def main() -> None:
 
 
 if __name__ == "__main__":
+    # _test_dataset()
     main()

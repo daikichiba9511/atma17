@@ -22,6 +22,9 @@ logger = log.get_root_logger()
 EXP_NO = __file__.split("/")[-2]
 DESCRIPTION = """
 simple baseline
++ promptの作り方を変える Title: <title> [SEP] Review_Text: <review> text>
++ fill_null("none")で埋める
++ aux task
 """
 
 
@@ -65,25 +68,35 @@ def preprocessing(df: pl.DataFrame) -> pl.DataFrame:
         pl.col("Title").fill_null("").alias("Title"),
         pl.col("Review Text").fill_null("").alias("Review Text"),
     ).with_columns(
-        (pl.col("Title") + " [TITLE] " + pl.col("Review Text")).alias("prompt"),
+        ("Titlte: " + pl.col("Title") + " [SEP] " + "Review Text: " + pl.col("Review Text")).alias("prompt"),
     )
     return df
 
 
 def tokenize(
-    df: dict,
+    data: dict,
     tokenizer: transformers.PreTrainedTokenizer | transformers.PreTrainedTokenizerFast,
     max_length: int = 256,
     padding: str | bool = False,
     truncation: bool = True,
 ) -> transformers.BatchEncoding:
-    return tokenizer(df["prompt"], truncation=truncation, max_length=max_length, padding=padding)
+    return tokenizer(data["prompt"], truncation=truncation, max_length=max_length, padding=padding)
+
+
+def to_onehot(data: dict) -> dict:
+    data["aux_labels"] = nn.functional.one_hot(torch.tensor(data["Rating"]), 6).float()
+    return data
 
 
 def compute_metrics(eval_pred: transformers.EvalPrediction) -> dict:
-    preds, labels = eval_pred
-    if not isinstance(labels, np.ndarray):
-        raise ValueError("labels should be numpy array")
+    preds, all_labels = eval_pred
+    if isinstance(all_labels, tuple):
+        labels = all_labels[0]
+    else:
+        labels = all_labels
+    if isinstance(preds, tuple):
+        preds = preds[0]
+
     preds = torch.softmax(torch.from_numpy(preds), dim=1).numpy()
     return {"auc": metrics.score(y_true=labels, y_pred=preds[:, 1])}
 
@@ -93,8 +106,46 @@ class LoggingCallback(transformers.TrainerCallback):
         logger.info(f"Eval on Trainer: {state.log_history[-1]}")
 
 
+class CustomTrainer(Trainer):
+    """
+    References:
+    1. https://dev.classmethod.jp/articles/huggingface-usage-custom-loss-func/
+    """
+
+    def compute_loss(
+        self, model: Atma17CustomModel, inputs: dict, return_outputs: bool = False
+    ) -> tuple[torch.Tensor, torch.Tensor] | torch.Tensor:
+        aux_labels = inputs.pop("aux_labels")
+        outputs = model(**inputs)
+        aux_loss = nn.functional.cross_entropy(input=outputs.aux_logits, target=aux_labels)
+        outputs["aux_loss"] = aux_loss
+        weight_aux_loss = 0.5
+        loss = outputs.loss + weight_aux_loss * aux_loss
+        return (loss, outputs) if return_outputs else loss
+
+
+def _test_dataset() -> None:
+    tokenizer = AutoTokenizer.from_pretrained("microsoft/deberta-v3-large")
+    train_df = pl.read_csv(constants.DATA_DIR / "train.csv")
+    train_df = preprocessing(train_df)
+    train_df = train_df.with_columns(pl.col("Recommended IND").cast(pl.Int32).alias("labels"))
+    ds_train = (
+        Dataset.from_pandas(
+            train_df.to_pandas(use_pyarrow_extension_array=True).iloc[:100].loc[:, ["prompt", "labels", "Rating"]]
+        )
+        .map(functools.partial(tokenize, tokenizer=tokenizer, max_length=256, padding=True))
+        .map(to_onehot)
+        # .remove_columns(["prompt", "__index_level_0__"])
+    )
+    ds_train.set_format(type="torch", columns=["input_ids", "attention_mask", "labels", "aux_labels"])
+    batch = next(iter(ds_train))
+    print(batch)
+    print(batch.keys())  # type: ignore
+
+
 def main() -> None:
     cfg = Config(is_debug=False)
+    cfg.output_dir.mkdir(parents=True, exist_ok=True)
     log.attach_file_handler(logger, str(cfg.output_dir / "train.log"))
     utils.pinfo(cfg.model_dump())
 
@@ -119,22 +170,30 @@ def main() -> None:
     for fold, (train_idx, valid_idx) in enumerate(
         kfold.split(train_df.to_pandas(use_pyarrow_extension_array=True), train_df[cfg.target_cols[0]])
     ):
-        logger.info(f"Start Training Fold: {fold}")
         utils.seed_everything(cfg.seed)
+        logger.info(f"Start Training Fold: {fold}")
         ds_train = (
             Dataset.from_pandas(
-                train_df.to_pandas(use_pyarrow_extension_array=True).iloc[train_idx].loc[:, ["prompt", "labels"]]
+                train_df.to_pandas(use_pyarrow_extension_array=True)
+                .iloc[train_idx]
+                .loc[:, ["prompt", "labels", "Rating"]],
             )
             .map(functools.partial(tokenize, tokenizer=tokenizer, max_length=cfg.max_length, padding=True))
+            .map(to_onehot)
             .remove_columns(["prompt", "__index_level_0__"])
         )
+        # ds_train.set_format(type="torch", columns=["input_ids", "attention_mask", "labels", "aux_labels"])
         ds_valid = (
             Dataset.from_pandas(
-                train_df.to_pandas(use_pyarrow_extension_array=True).iloc[valid_idx].loc[:, ["prompt", "labels"]]
+                train_df.to_pandas(use_pyarrow_extension_array=True)
+                .iloc[valid_idx]
+                .loc[:, ["prompt", "labels", "Rating"]]
             )
             .map(functools.partial(tokenize, tokenizer=tokenizer, max_length=cfg.max_length, padding=True))
+            .map(to_onehot)
             .remove_columns(["prompt", "__index_level_0__"])
         )
+        # ds_valid.set_format(type="torch", columns=["input_ids", "attention_mask", "labels", "aux_labels"])
         train_args = TrainingArguments(
             output_dir=str(cfg.output_dir / f"fold{fold}"),
             fp16=True,
@@ -160,9 +219,14 @@ def main() -> None:
             data_seed=cfg.seed,
             optim="adamw_torch",
             load_best_model_at_end=True,
+            label_names=["labels", "aux_labels"],
         )
         model = Atma17CustomModel(model_path=cfg.model_path)
-        trainer = Trainer(
+        # dummy forward for lazy initialization
+        i = torch.randint(0, 1000, (8, 256))
+        _ = model(i, torch.randint(0, 2, (8,)))
+
+        trainer = CustomTrainer(
             model=model,
             args=train_args,
             train_dataset=ds_train,
@@ -182,7 +246,9 @@ def main() -> None:
             trainer.model.state_dict(),
             str(cfg.output_dir / f"deverta-large-seed{cfg.seed}-fold{fold}" / f"best_model_fold{fold}.pth"),
         )
-        preds[valid_idx] = torch.tensor(trainer.predict(ds_valid).predictions).softmax(dim=1).numpy()  # type: ignore
+        preds_ = trainer.predict(ds_valid).predictions[0]  # type: ignore
+        preds_ = torch.tensor(preds_).softmax(dim=1).numpy()  # type: ignore
+        preds[valid_idx] = preds_
         folds[valid_idx] = fold
 
     train_df = train_df.with_columns(pl.Series("preds", preds[:, 1]), pl.Series("folds", folds))
@@ -193,4 +259,5 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    _test_dataset()
+    # main()

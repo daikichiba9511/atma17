@@ -22,6 +22,8 @@ logger = log.get_root_logger()
 EXP_NO = __file__.split("/")[-2]
 DESCRIPTION = """
 simple baseline
++ promptの作り方を変える Title: <title> [SEP] Review_Text: <review> text>
++ fill_null("none")で埋める
 """
 
 
@@ -62,10 +64,11 @@ class Config(pydantic.BaseModel):
 
 def preprocessing(df: pl.DataFrame) -> pl.DataFrame:
     df = df.with_columns(
-        pl.col("Title").fill_null("").alias("Title"),
-        pl.col("Review Text").fill_null("").alias("Review Text"),
+        pl.col("Title").fill_null("none").alias("Title"),
+        pl.col("Review Text").fill_null("none").alias("Review Text"),
     ).with_columns(
-        (pl.col("Title") + " [TITLE] " + pl.col("Review Text")).alias("prompt"),
+        # (pl.col("Title") + " [TITLE] " + pl.col("Review Text")).alias("prompt"),
+        ("Titlte: " + pl.col("Title") + " [SEP] " + "Review_Text: " + pl.col("Review Text")).alias("prompt"),
     )
     return df
 
@@ -95,6 +98,7 @@ class LoggingCallback(transformers.TrainerCallback):
 
 def main() -> None:
     cfg = Config(is_debug=False)
+    cfg.output_dir.mkdir(parents=True, exist_ok=True)
     log.attach_file_handler(logger, str(cfg.output_dir / "train.log"))
     utils.pinfo(cfg.model_dump())
 
@@ -119,8 +123,8 @@ def main() -> None:
     for fold, (train_idx, valid_idx) in enumerate(
         kfold.split(train_df.to_pandas(use_pyarrow_extension_array=True), train_df[cfg.target_cols[0]])
     ):
-        logger.info(f"Start Training Fold: {fold}")
         utils.seed_everything(cfg.seed)
+        logger.info(f"Start Training Fold: {fold}")
         ds_train = (
             Dataset.from_pandas(
                 train_df.to_pandas(use_pyarrow_extension_array=True).iloc[train_idx].loc[:, ["prompt", "labels"]]
